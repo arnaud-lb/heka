@@ -16,11 +16,8 @@
 package kafka
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync/atomic"
 	"time"
 
@@ -53,7 +50,8 @@ type KafkaInputConfig struct {
 	MinFetchSize     int32  `toml:"min_fetch_size"`
 	MaxMessageSize   int32  `toml:"max_message_size"`
 	MaxWaitTime      uint32 `toml:"max_wait_time"`
-	OffsetMethod     string `toml:"offset_method"` // Manual, Newest, Oldest
+	OffsetMethod     string `toml:"offset_method"`  // Manual, Newest, Oldest
+	InitialOffset    string `toml:"initial_offset"` // Newest, Oldest
 	EventBufferSize  int    `toml:"event_buffer_size"`
 }
 
@@ -61,16 +59,17 @@ type KafkaInput struct {
 	processMessageCount    int64
 	processMessageFailures int64
 
-	config             *KafkaInputConfig
-	saramaConfig       *sarama.Config
-	consumer           sarama.Consumer
-	partitionConsumer  sarama.PartitionConsumer
-	pConfig            *pipeline.PipelineConfig
-	ir                 pipeline.InputRunner
-	checkpointFile     *os.File
-	stopChan           chan bool
-	name               string
-	checkpointFilename string
+	config                 *KafkaInputConfig
+	saramaConfig           *sarama.Config
+	client                 sarama.Client
+	consumer               sarama.Consumer
+	partitionConsumer      sarama.PartitionConsumer
+	offsetManager          sarama.OffsetManager
+	partitionOffsetManager sarama.PartitionOffsetManager
+	pConfig                *pipeline.PipelineConfig
+	ir                     pipeline.InputRunner
+	stopChan               chan bool
+	name                   string
 }
 
 func (k *KafkaInput) ConfigStruct() interface{} {
@@ -89,38 +88,9 @@ func (k *KafkaInput) ConfigStruct() interface{} {
 		MinFetchSize:               1,
 		MaxWaitTime:                250,
 		OffsetMethod:               "Manual",
+		InitialOffset:              "Oldest",
 		EventBufferSize:            16,
 	}
-}
-
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	if err == nil {
-		return true
-	}
-	return false
-}
-
-func (k *KafkaInput) writeCheckpoint(offset int64) (err error) {
-	if k.checkpointFile == nil {
-		if k.checkpointFile, err = os.OpenFile(k.checkpointFilename,
-			os.O_WRONLY|os.O_SYNC|os.O_CREATE|os.O_TRUNC, 0644); err != nil {
-			return
-		}
-	}
-	k.checkpointFile.Seek(0, 0)
-	err = binary.Write(k.checkpointFile, binary.LittleEndian, &offset)
-	return
-}
-
-func readCheckpoint(filename string) (offset int64, err error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-	err = binary.Read(file, binary.LittleEndian, &offset)
-	return
 }
 
 func (k *KafkaInput) SetPipelineConfig(pConfig *pipeline.PipelineConfig) {
@@ -155,46 +125,48 @@ func (k *KafkaInput) Init(config interface{}) (err error) {
 	k.saramaConfig.Consumer.Fetch.Min = k.config.MinFetchSize
 	k.saramaConfig.Consumer.Fetch.Max = k.config.MaxMessageSize
 	k.saramaConfig.Consumer.MaxWaitTime = time.Duration(k.config.MaxWaitTime) * time.Millisecond
-	k.checkpointFilename = k.pConfig.Globals.PrependBaseDir(filepath.Join("kafka",
-		fmt.Sprintf("%s.%s.%d.offset.bin", k.name, k.config.Topic, k.config.Partition)))
 
-	var offset int64
-	switch k.config.OffsetMethod {
-	case "Manual":
-		if fileExists(k.checkpointFilename) {
-			if offset, err = readCheckpoint(k.checkpointFilename); err != nil {
-				return fmt.Errorf("readCheckpoint %s", err)
-			}
-		} else {
-			if err = os.MkdirAll(filepath.Dir(k.checkpointFilename), 0766); err != nil {
-				return err
-			}
-			offset = sarama.OffsetOldest
-		}
-	case "Newest":
-		offset = sarama.OffsetNewest
-		if fileExists(k.checkpointFilename) {
-			if err = os.Remove(k.checkpointFilename); err != nil {
-				return err
-			}
-		}
+	switch k.config.InitialOffset {
 	case "Oldest":
-		offset = sarama.OffsetOldest
-		if fileExists(k.checkpointFilename) {
-			if err = os.Remove(k.checkpointFilename); err != nil {
-				return err
-			}
-		}
+		k.saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
+	case "Newest":
+		k.saramaConfig.Consumer.Offsets.Initial = sarama.OffsetNewest
 	default:
-		return fmt.Errorf("invalid offset_method: %s", k.config.OffsetMethod)
+		return fmt.Errorf("invalid initial_offset: %s", k.config.InitialOffset)
 	}
 
 	k.saramaConfig.ChannelBufferSize = k.config.EventBufferSize
 
-	k.consumer, err = sarama.NewConsumer(k.config.Addrs, k.saramaConfig)
+	k.client, err = sarama.NewClient(k.config.Addrs, k.saramaConfig)
 	if err != nil {
 		return err
 	}
+
+	var offset int64
+	switch k.config.OffsetMethod {
+	case "Manual":
+		k.offsetManager, err = sarama.NewOffsetManagerFromClient(k.config.Group, k.client)
+		if err != nil {
+			return err
+		}
+		k.partitionOffsetManager, err = k.offsetManager.ManagePartition(k.config.Topic, k.config.Partition)
+		if err != nil {
+			return err
+		}
+		offset, _ = k.partitionOffsetManager.NextOffset()
+	case "Newest":
+		offset = sarama.OffsetNewest
+	case "Oldest":
+		offset = sarama.OffsetOldest
+	default:
+		return fmt.Errorf("invalid offset_method: %s", k.config.OffsetMethod)
+	}
+
+	k.consumer, err = sarama.NewConsumerFromClient(k.client)
+	if err != nil {
+		return err
+	}
+
 	k.partitionConsumer, err = k.consumer.ConsumePartition(k.config.Topic, k.config.Partition, offset)
 	return err
 }
@@ -214,10 +186,10 @@ func (k *KafkaInput) Run(ir pipeline.InputRunner, h pipeline.PluginHelper) (err 
 
 	defer func() {
 		k.partitionConsumer.Close()
+		k.partitionOffsetManager.Close()
+		k.offsetManager.Close()
 		k.consumer.Close()
-		if k.checkpointFile != nil {
-			k.checkpointFile.Close()
-		}
+		k.client.Close()
 		sRunner.Done()
 	}()
 	k.ir = ir
@@ -263,9 +235,7 @@ func (k *KafkaInput) Run(ir pipeline.InputRunner, h pipeline.PluginHelper) (err 
 			}
 
 			if k.config.OffsetMethod == "Manual" {
-				if err = k.writeCheckpoint(event.Offset + 1); err != nil {
-					return err
-				}
+				k.partitionOffsetManager.MarkOffset(event.Offset, "")
 			}
 
 		case cError, ok = <-cErrChan:
@@ -273,18 +243,6 @@ func (k *KafkaInput) Run(ir pipeline.InputRunner, h pipeline.PluginHelper) (err 
 				// Don't exit until the eventChan is closed.
 				ok = true
 				continue
-			}
-			if cError.Err == sarama.ErrOffsetOutOfRange {
-				ir.LogError(fmt.Errorf(
-					"removing the out of range checkpoint file and stopping"))
-				if k.checkpointFile != nil {
-					k.checkpointFile.Close()
-					k.checkpointFile = nil
-				}
-				if err := os.Remove(k.checkpointFilename); err != nil {
-					ir.LogError(err)
-				}
-				return err
 			}
 			atomic.AddInt64(&k.processMessageFailures, 1)
 			ir.LogError(cError.Err)
